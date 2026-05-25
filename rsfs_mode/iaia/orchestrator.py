@@ -15,7 +15,7 @@ from typing import Any, Sequence
 from agents.base import Candidate, CompetingAgent
 from tol.dispatcher import ToLDispatcher
 from truth.arbiter import Arbiter
-from truth.models import The_Truth
+from truth.models import The_Truth, seal
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,7 @@ class Request:
     payload: Any
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     deadline_seconds: float = 30.0
+    max_refans: int = 2
 
 
 class IAiA:
@@ -42,17 +43,28 @@ class IAiA:
         self._tol = tol
 
     async def run(self, request: Request) -> The_Truth:
-        candidates = await self._fan_out(request)
-        if not candidates:
-            # TODO(pyraclaw-spec): surface vs. re-fan-out on zero candidates.
-            raise RuntimeError(f"no candidates produced for {request.request_id}")
+        attempts = 0
+        candidates: list[Candidate] = []
+        while True:
+            candidates = await self._fan_out(request)
+            if candidates:
+                break
+            if attempts >= request.max_refans:
+                raise RuntimeError(
+                    f"no candidates produced for {request.request_id} after "
+                    f"{attempts + 1} fan-out rounds"
+                )
+            attempts += 1
         winner = self._arbiter.select(candidates)
-        truth = The_Truth(
-            request_id=request.request_id,
-            payload=winner.payload,
-            producer=winner.producer,
-            scores=winner.scores,
-            sealed_at=datetime.now(timezone.utc),
+        truth = seal(
+            The_Truth(
+                request_id=request.request_id,
+                payload=winner.payload,
+                producer=winner.producer,
+                scores=winner.scores,
+                sealed_at=datetime.now(timezone.utc),
+                signature="",  # filled by seal()
+            )
         )
         await self._tol.dispatch(truth)
         return truth
