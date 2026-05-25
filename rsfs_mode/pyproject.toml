@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rsfs_mode"
+version = "0.0.0"
+description = "Pyraclaw Top-Layer Orchestration: iAiA over competing agents, single route to truth."
+requires-python = ">=3.10"
+dependencies = [
+  # TODO(pyraclaw-spec): pin once hermes-agent is published to an index.
+  # For now install editably: `pip install -e ../hermes-agent`
+  "hermes-agent",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+  "ruff",
+]
+
+[project.scripts]
+rsfs = "rsfs_mode.iaia.orchestrator:cli"
+
+[tool.setuptools.packages.find]
+include = ["iaia*", "agents*", "truth*", "tol*", "hermes_bridge*"]
