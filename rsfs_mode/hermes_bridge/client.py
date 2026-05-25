@@ -1,28 +1,93 @@
-"""Thin wrapper around hermes-agent.
+"""Subprocess bridge onto hermes-agent's ``run_agent.py``.
 
-The real surface depends on which hermes entrypoint we standardise on
-(`run_agent.py`, the `hermes_cli` package, or the in-proc API). Capturing that
-here is `TODO(pyraclaw-spec)` once the orchestrator-side contract is fixed.
+One fork per invocation — no shared in-process state, which preserves the
+no-shared-cache rule the single-route-to-truth model depends on. The wrapper
+is intentionally narrow: it kicks the subprocess, honors the deadline, and
+returns a raw payload + telemetry. Scoring is the competing-agent's job.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+import asyncio
+import os
+import shlex
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any, Mapping
+
+
+@dataclass
+class HermesResult:
+    stdout: str
+    stderr: str
+    returncode: int
+    wall_seconds: float
+    timed_out: bool = False
 
 
 @dataclass
 class HermesClient:
-    """Placeholder bridge. Real implementation must:
+    """Invokes hermes-agent's run_agent.py as a subprocess.
 
-    1. Accept a prompt + tool budget + deadline.
-    2. Invoke hermes-agent (CLI subprocess OR in-proc) deterministically.
-    3. Return a raw payload + telemetry that `agents/` can score against.
+    Configuration:
+      script_path: absolute path to run_agent.py (defaults to env
+                   RSFS_HERMES_RUN_AGENT or ./hermes-agent/run_agent.py)
+      python:      interpreter to use (defaults to sys.executable)
+      extra_args:  extra CLI args appended to every invocation
+      env:         additional env vars merged on top of os.environ
     """
 
-    endpoint: str = "in-proc"  # TODO(pyraclaw-spec): or HTTP, or subprocess.
-
-    async def invoke(self, prompt: str, **kwargs: Any) -> Any:
-        raise NotImplementedError(
-            "HermesClient.invoke is a placeholder — wire to hermes-agent. "
-            "See hermes-agent docs/rsfs_mode_integration.md."
+    script_path: str = field(
+        default_factory=lambda: os.environ.get(
+            "RSFS_HERMES_RUN_AGENT", "./hermes-agent/run_agent.py"
         )
+    )
+    python: str = field(default_factory=lambda: sys.executable)
+    extra_args: tuple[str, ...] = ()
+    env: Mapping[str, str] = field(default_factory=dict)
+
+    async def invoke(
+        self,
+        prompt: str,
+        *,
+        deadline_seconds: float,
+        tool_budget: int | None = None,
+    ) -> HermesResult:
+        cmd: list[str] = [self.python, self.script_path, "--prompt", prompt]
+        if tool_budget is not None:
+            cmd += ["--tool-budget", str(tool_budget)]
+        cmd += list(self.extra_args)
+
+        merged_env = {**os.environ, **self.env}
+        started = time.monotonic()
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=merged_env,
+        )
+        timed_out = False
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=deadline_seconds
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+            proc.kill()
+            stdout_b, stderr_b = await proc.communicate()
+        elapsed = time.monotonic() - started
+        return HermesResult(
+            stdout=stdout_b.decode("utf-8", errors="replace"),
+            stderr=stderr_b.decode("utf-8", errors="replace"),
+            returncode=proc.returncode if proc.returncode is not None else -1,
+            wall_seconds=elapsed,
+            timed_out=timed_out,
+        )
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "transport": "subprocess",
+            "script_path": self.script_path,
+            "python": self.python,
+            "extra_args": list(self.extra_args),
+        }
